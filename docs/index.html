@@ -67,10 +67,20 @@
 
 <h2>1. Introduction</h2>
 <p>
-A content team managing a large site cannot manually review every page every month. When search performance data shows that many pages are drifting downward, the practical question is not "why is every page declining" but "which pages should a human look at first, given limited review time?"
+FlyRank tracks search performance for many client sites at once. Each client's
+content library can run into the hundreds or thousands of pages, and a small
+content team cannot manually re-check every page every month to see which ones
+are slipping in search results. In practice, the team needs a short, trustworthy
+list: which pages are worth reviewing first, this week, given limited time.
 </p>
 <p>
-This project builds and honestly validates a way to answer that question: a ranked queue of pages most likely to be declining, backed by reason codes a reviewer can sanity-check. The starting point was a broader exploration into grouping content by shared performance patterns; the work that follows, and that this paper reports, converged on a more concrete and testable version of that question — predicting decline likelihood for prioritization, benchmarked honestly against a transparent rule.
+This project builds and honestly validates one way to produce that list. The
+starting point was a broader exploration into grouping content by shared
+performance patterns; the work that follows, and that this paper reports,
+converged on a more concrete and testable version of that question —
+identifying pages already showing decline signals within the current data
+snapshot, so a human reviewer can prioritize them, benchmarked against a
+transparent rule-based baseline rather than presented alone.
 </p>
 
 <h2>2. Data</h2>
