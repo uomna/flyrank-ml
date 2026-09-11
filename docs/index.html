@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Which Content Pages Decline First? A Grouped-Split Model vs. a Rule Baseline</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 24px 20px 80px;
+    line-height: 1.6;
+    color: #1a1a1a;
+    background: #fdfdfd;
+  }
+  h1 { font-size: 1.7em; line-height: 1.3; margin-bottom: 4px; }
+  h2 { font-size: 1.25em; margin-top: 2.2em; border-bottom: 2px solid #eee; padding-bottom: 6px; }
+  h3 { font-size: 1.05em; margin-top: 1.4em; }
+  .subtitle { color: #666; font-size: 1.05em; margin-bottom: 28px; }
+  .abstract {
+    background: #f4f7fb;
+    border-left: 4px solid #5B8DEF;
+    padding: 16px 20px;
+    border-radius: 4px;
+    margin-bottom: 32px;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 0.95em; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+  th { background: #f4f4f4; }
+  code {
+    background: #f0f0f0;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 0.9em;
+  }
+  ul, ol { padding-left: 22px; }
+  li { margin-bottom: 6px; }
+  img { max-width: 100%; border: 1px solid #eee; border-radius: 6px; margin: 12px 0; }
+  .caption { font-size: 0.9em; color: #666; text-align: center; margin-top: -6px; margin-bottom: 20px; }
+  .callout {
+    background: #fff7e6;
+    border-left: 4px solid #e0a020;
+    padding: 12px 16px;
+    border-radius: 4px;
+    margin: 16px 0;
+    font-size: 0.95em;
+  }
+  footer {
+    margin-top: 60px;
+    padding-top: 20px;
+    border-top: 1px solid #eee;
+    font-size: 0.9em;
+    color: #666;
+  }
+  a { color: #2E6BE0; }
+</style>
+</head>
+<body>
+
+<h1>Which Content Pages Decline First?</h1>
+<p class="subtitle">A grouped-split logistic regression model vs. a rule-based baseline, on anonymized search-content data</p>
+
+<div class="abstract">
+<strong>Abstract.</strong> Content teams reviewing hundreds or thousands of pages need a way to prioritize which ones to check first for declining search performance. We compare a simple rule-based baseline (flagging pages whose click-through rate falls below what their search position normally gets) against a Logistic Regression model trained on 30,000 anonymized content items. Using a client-grouped validation split to avoid leaking client identity between training and test data, the model reaches 0.74 precision@50, versus 0.56 for the rule baseline and a 0.54 base rate. An earlier version of the model scored a suspicious 1.00 precision, traced to leaked features and removed before this result. This work supports a human-reviewed triage queue, not an automated decision system.
+</div>
+
+<h2>1. Introduction</h2>
+<p>
+A content team managing a large site cannot manually review every page every month. When search performance data shows that many pages are drifting downward, the practical question is not "why is every page declining" but "which pages should a human look at first, given limited review time?"
+</p>
+<p>
+This project builds and honestly validates a way to answer that question: a ranked queue of pages most likely to be declining, backed by reason codes a reviewer can sanity-check. The starting point was a broader exploration into grouping content by shared performance patterns; the work that follows, and that this paper reports, converged on a more concrete and testable version of that question — predicting decline likelihood for prioritization, benchmarked honestly against a transparent rule.
+</p>
+
+<h2>2. Data</h2>
+<p>
+<strong>Source:</strong> <code>content_refresh_anonymized.csv</code> — a 30,000-row, 44-column anonymized snapshot derived from the FlyRank search-intelligence warehouse (<code>fact_content_daily_performance</code>), one row per content item.
+</p>
+<p>
+<strong>Scope note:</strong> the full production warehouse (content-client-day grain, queried via DuckDB over remote Parquet) spans 2026-03-01 to 2026-03-31 for development, with June 2026 held out as a sealed test window. This work uses the fixed 30K-row starter extract, not the full 9.8M-row daily panel.
+</p>
+<p><strong>Excluded fields, and why:</strong></p>
+<ul>
+  <li><code>client_has_gsc</code>, <code>client_has_ga4</code>, <code>gsc_data_available</code>, <code>ga4_data_available</code> — data-availability flags, not performance signals; including them risks confusing "no data collected" with "the content performed poorly."</li>
+  <li><code>trend_direction</code>, <code>trend_pct</code> — these define the label itself; using them as features would leak the answer.</li>
+  <li><code>impressions_last_30d</code>, <code>clicks_last_30d</code>, <code>sessions_last_30d</code>, <code>impressions_prev_30d</code>, <code>clicks_prev_30d</code>, <code>sessions_prev_30d</code> — removed after a leakage audit; these are near-siblings of how the label's underlying trend was computed.</li>
+  <li><code>content_id</code>, <code>client_id</code> — identifiers only, used for grouping/joining, never as model inputs.</li>
+</ul>
+<div class="callout">
+<strong>Key data-quality trap:</strong> in the full warehouse, <code>gsc_clicks</code> defaults to 0 (not NULL) when GSC data is unavailable — affecting 63.3% of rows. Any click-based feature must first filter to <code>gsc_data_available = TRUE</code>, or it silently undercounts most rows. This starter extract is a cleaner derived sample, but the same caution applies to any future work directly on the warehouse.
+</div>
+<p><strong>Public-safe:</strong> no client names appear anywhere; <code>content_id</code> and <code>client_id</code> are anonymized hashes; no raw queries or URLs are included.</p>
+
+<h2>3. Methodology</h2>
+<p><strong>Label:</strong> <code>is_declining_label</code> = 1 if <code>trend_direction == "down"</code>, else 0. Base rate: 54.2% (16,262 of 30,000 rows) — a fairly balanced target.</p>
+
+<p><strong>Baseline (rule-based):</strong> a page is flagged if it ranks well but its click-through rate falls below what pages at that same search-position tier normally get, and it receives enough impressions to matter (500+ in 90 days). Score = (tier average CTR − page CTR) × impressions, applied only when both conditions hold. Reason code: <code>ctr_below_position_tier</code>. Action: <em>review title and meta description</em>.</p>
+
+<p><strong>Model:</strong> Logistic Regression — chosen for interpretability. Its coefficients can be printed and read directly, which matters for producing reason codes a reviewer can trust, and it gives a fair first comparison against the rule baseline.</p>
+
+<p><strong>Features (21 after leakage removal):</strong> numeric signals available before the label window — search volume, competition, CPC, word count, 90-day traffic metrics (impressions, clicks, pageviews, sessions, users, engaged sessions, AI sessions, scroll events), content age, days since last update, CTR, average position, engagement rate, scroll rate, AI-traffic share. Missing values filled by median (fit on training data only). Features scaled with StandardScaler.</p>
+
+<p><strong>Validation design:</strong> grouped split by <code>client_id</code> (80/20), not random. The starter data has no per-row date, so a random split would let the same client's pages appear in both train and test — letting the model partly recognize clients it had already seen, rather than learning what decline looks like in general. Grouping matches the real deployment question: will this work for a client the model has never seen?</p>
+
+<p><strong>Leakage checks (two rounds):</strong></p>
+<ol>
+  <li>A first model attempt scored a suspicious 1.00 precision@50. Coefficient inspection showed <code>impressions_last_30d</code> and <code>impressions_prev_30d</code> at 10–30x the size of every other feature — both are near-siblings of the components the label's trend was built from. The full <code>last_30d</code>/<code>prev_30d</code> family (6 columns) was removed and the model retrained.</li>
+  <li>After removal, no feature dominates — the largest remaining coefficient (<code>users_90d</code>) is roughly 30x smaller than the leaky one was. Cross-checked against a random (non-grouped) split on the same clean features: the random split scored 0.86 vs. 0.74 grouped, a 12-point gap confirming the random split had been overstating performance by leaking client identity across train and test.</li>
+</ol>
+
+<p><strong>Metric:</strong> precision@50 — of the top 50 highest-scored pages, what fraction were actually declining. Chosen because the real use case is a fixed-size ranked review queue, not a global classification score.</p>
+
+<h2>4. Results</h2>
+<table>
+<tr><th>Method</th><th>Precision@50</th></tr>
+<tr><td>Base rate (guessing)</td><td>0.54</td></tr>
+<tr><td>Baseline (CTR-gap rule)</td><td>0.56</td></tr>
+<tr><td>Logistic regression (leaky, before audit)</td><td>1.00</td></tr>
+<tr><td>Logistic regression (clean, final)</td><td><strong>0.74</strong></td></tr>
+</table>
+
+<img src="results_precision_chart.png" alt="Bar chart comparing precision@50 across base rate, baseline rule, and the clean logistic regression model">
+<p class="caption">Model vs. baseline vs. base rate, grouped client split</p>
+
+<p>
+The honest result: logistic regression measured 0.74 precision@50 against 0.56 for the rule baseline on the same grouped test split — an 18-point observed gap, and 20 points above the 0.54 base rate. The leaky version (1.00) is shown for transparency, not as a result — it was the signal that triggered the leakage audit described in Methodology.
+</p>
+<p>
+A random (non-grouped) split on the same clean features scored 0.86 — 12 points higher than the honest grouped-split number. This confirms the grouped split was necessary: a random split lets the model partially recognize clients already seen in training, inflating apparent precision.
+</p>
+
+<h2>5. Limitations</h2>
+<ul>
+  <li><strong>Sample scope:</strong> trained and validated on a 30,000-row snapshot covering 32 clients and one 90-day trailing window. Not tested against the full 9.8M-row warehouse or clients outside those 32.</li>
+  <li><strong>Single split, not cross-validated:</strong> precision@50 = 0.74 comes from one grouped train/test split. Read it as a directional estimate, not a guaranteed number.</li>
+  <li><strong>No time-based validation:</strong> the starter data carries no per-row date, so this work cannot say how fast a page's status changes or how often to re-run scoring.</li>
+  <li><strong>Correlation, not causation:</strong> the model finds that low engagement correlates with decline; it does not prove why a specific page is declining.</li>
+  <li><strong>Imputation blind spot:</strong> in the test split, word count is missing for ~13% of rows and several fields for ~8%; 486 of 5,821 test rows have 3 or more missing features filled by median. Scores for these pages rest partly on assumptions, not full measurements.</li>
+  <li><strong>Error pattern:</strong> manual review of wrong top-50 cases showed the model struggles most with low-impression pages (where CTR is naturally noisy) and cannot distinguish a stable weak page from one that is already recovering, since momentum-related features were removed as leaky.</li>
+  <li><strong>Label definition:</strong> the decline label is a proxy derived from this same snapshot, not a verified ground-truth business outcome.</li>
+</ul>
+
+<h2>6. Ranked Recommendations</h2>
+<p>
+This model powers a ranked review queue: the top-scored pages, each with a reason code (the top two features driving that page's score) and an action label — a triage aid answering "where should a human look first," not "what should change on the page."
+</p>
+<p>
+In the top 20 of the test-split queue, "content is old" combined with "low engaged users" is the most common reason-code pair, mapping mostly to <em>Refresh content</em> — followed by "low impressions" (paired with content age) routed to <em>Review manually</em>, and a smaller cluster of "low scroll rate; low engaged users" mapping to <em>Improve engagement</em>. This is broadly consistent with the Methodology coefficient audit, where content age and engaged users both ranked among the top features.
+</p>
+<p><strong>Recommended workflow:</strong></p>
+<ol>
+  <li>Pull the top-ranked pages from the queue.</li>
+  <li>Before acting on any row, check: does the reason code fit this page's content type? Is the score built on real data or partly imputed values? Is the page still live and owned by an active client?</li>
+  <li>Route by action label — engagement issues to a content/UX reviewer, CTR/snippet issues to whoever owns titles and meta descriptions, aging content to the content calendar.</li>
+  <li>Treat every row as a hypothesis to confirm, not an instruction to execute — precision@50 = 0.74 means roughly 1 in 4 rows will not actually be declining.</li>
+</ol>
+<div class="callout">
+<strong>Never automate from this queue:</strong> auto-publishing content changes, auto-deleting pages, or auto-adjusting client-facing titles/meta descriptions directly from the model score; using the score as a client-facing quality grade; or re-ranking using the label columns themselves.
+</div>
+<p><strong>Monitoring:</strong> re-score after any new data pull, and spot-check roughly 20 acted-on rows monthly against their actual outcome — if the hit rate drifts well below 0.74, that signals a need for re-validation, not just re-scoring.</p>
+
+<h2>7. Reproducibility</h2>
+<p>
+All code, notebooks, and data contracts referenced in this paper live in the public repository:
+<a href="https://github.com/uomna/flyrank-ml" target="_blank">github.com/uomna/flyrank-ml</a>, under <code>work/notebooks/</code>. The capstone notebook (<code>capstone.ipynb</code>) reproduces every table and chart in this paper end to end, including the baseline, the leakage audit, the grouped-split model, and the ranked queue export. Model training uses <code>random_state=42</code> throughout for reproducible splits.
+</p>
+
+<h2>Acknowledgments &amp; Data Credit</h2>
+<p>
+Built on the FlyRank ML Internship dataset. Data and program credit: <a href="https://flyrank.ai" target="_blank">https://flyrank.ai</a>.
+</p>
+
+<footer>
+  Uomna — AI/ML Intern, FlyRank AI Internship. Connect on <a href="#">LinkedIn</a>.
+</footer>
+
+</body>
+</html>
